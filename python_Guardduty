@@ -1,1 +1,419 @@
 https://medium.com/%40peacedennis/deploy-aws-lambda-that-scans-newly-uploaded-s3-files-with-clamav-a-complete-guide-611bee4beab6
+https://margueriteashby.com/blog.html?
+https://medium.com/%40megashby_7031/migrating-to-guardduty-malware-protection-for-s3-1b5fe44d5e84
+https://www.mechanicalrock.io/blog/malware-protected-file-upload-with-s3-and-guardduty
+| Scenario                         | HTTP | Status       |
+| -------------------------------- | ---: | ------------ |
+| Invalid JWT                      |  401 | Unauthorized |
+| JWT valid but user not permitted |  403 | Forbidden    |
+| Document doesn't exist           |  404 | Not Found    |
+| User doesn't own document        |  403 | Forbidden    |
+| File still scanning              |  409 | Scan Pending |
+| Malware detected                 |  403 | Malicious    |
+| Scan failed                      |  503 | Scan Failed  |
+| Unsupported file                 |  422 | Unsupported  |
+| Clean                            |  200 | Success      |
+
+
+
+
+----------
+
+Postman
+   ↓
+API Gateway REST
+   ↓
+Python Lambda Authorizer
+   ↓
+Python Upload Lambda
+   ↓
+S3 Quarantine
+   ↓
+GuardDuty Malware Protection
+   ↓
+EventBridge
+   ↓
+Python Scan Result Lambda
+   ↓
+S3 Clean
+   ↓
+DynamoDB
+   ↓
+Python Download Lambda
+   ↓
+S3 GET Pre-Signed URL
+
+-------------------Sample project for local ---- 
+                     CUSTOMER
+                        |
+                        | JWT
+                        v
+              +---------------------+
+              | API Gateway REST API|
+              +----------+----------+
+                         |
+                         v
+              +---------------------+
+              | Lambda Authorizer   |
+              |      Python         |
+              +----------+----------+
+                         |
+                         | Authorized User
+                         v
+              +---------------------+
+              | Upload URL Lambda   |
+              |      Python         |
+              +----------+----------+
+                         |
+                         | PUT Pre-Signed URL
+                         v
+              +---------------------+
+              | S3 QUARANTINE       |
+              | Private Bucket      |
+              +----------+----------+
+                         |
+                         | Object Created
+                         v
+              +---------------------+
+              | GuardDuty Malware   |
+              | Protection for S3   |
+              +----------+----------+
+                         |
+                         | Scan Result
+                         v
+              +---------------------+
+              | EventBridge         |
+              +----------+----------+
+                         |
+                         v
+              +---------------------+
+              | Scan Result Lambda  |
+              |      Python         |
+              +----------+----------+
+                         |
+                +--------+--------+
+                |                 |
+             CLEAN             MALICIOUS
+                |                 |
+                v                 v
+       +----------------+    Keep in
+       | S3 CLEAN       |    Quarantine
+       | Private Bucket |    / Delete
+       +-------+--------+
+               |
+               |
+               | User requests download
+               |
+               v
+       +---------------------+
+       | API Gateway         |
+       | GET Download URL   |
+       +----------+----------+
+                  |
+                  v
+       +---------------------+
+       | Lambda Authorizer   |
+       +----------+----------+
+                  |
+                  v
+       +---------------------+
+       | Download URL       |
+       | Lambda             |
+       +----------+----------+
+                  |
+                  v
+       +---------------------+
+       | GET Pre-Signed URL |
+       +----------+----------+
+                  |
+                  v
+              CUSTOMER
+                  |
+                  v
+          Download Clean File
+
+
+
+---------------------
+S3 Quarantine Object
+        |
+        v
+GuardDuty Scan
+        |
+        v
+Object Tags
+        |
+        +-- GuardDutyMalwareScanStatus=NO_THREATS_FOUND
+
+
+---------------
+
+Upload
+   |
+   v
+S3 Quarantine
+   |
+   v
+GuardDuty
+   |
+   v
+EventBridge
+   |
+   v
+Scan Result Lambda
+   |
+   +---- CLEAN
+   |       |
+   |       v
+   |   Copy to Clean S3
+   |
+   +---- MALICIOUS
+           |
+           v
+       Don't copy
+
+
+Customer
+   |
+   | GET /download
+   | JWT
+   v
+API Gateway
+   |
+   v
+Lambda Authorizer
+   |
+   v
+Download Lambda
+   |
+   +---- Extract USER ID from JWT
+   |
+   +---- Determine S3 object key
+   |
+   +---- Check clean bucket
+   |
+   +---- Generate GET pre-signed URL
+   |
+   v
+Customer
+-----------------  Recommended ---- 
+
+             Browser / Web App
+                    |
+                    | JWT
+                    v
+             API Gateway REST
+                    |
+                    v
+             Lambda Authorizer
+                    |
+                    v
+            Upload URL Lambda
+                    |
+                    v
+          PUT Pre-Signed URL
+                    |
+                    v
+             S3 Quarantine
+                    |
+                    v
+       GuardDuty Malware Protection
+                    |
+                    v
+               EventBridge
+                    |
+                    v
+         Scan Result Lambda
+              /          \
+             /            \
+         CLEAN          MALICIOUS
+           |                |
+           v                v
+     S3 Clean         Quarantine/Delete
+           |
+           |
+           v
+       Download API
+           |
+           v
+       Lambda
+           |
+           v
+    GET Pre-Signed URL
+           |
+           v
+         Browser
+
+----------
+| Service                                 | Use                        |
+| --------------------------------------- | -------------------------- |
+| **API Gateway REST**                    | API entry point            |
+| **Lambda Authorizer**                   | JWT validation             |
+| **Lambda Python**                       | Generate upload URL        |
+| **S3 Quarantine**                       | Untrusted files            |
+| **GuardDuty Malware Protection for S3** | Virus/malware scanning     |
+| **EventBridge**                         | Scan result event          |
+| **Lambda Python**                       | Process scan result        |
+| **S3 Clean**                            | Virus-free files           |
+| **Lambda Python**                       | Generate download URL      |
+| **S3 Object Tags**                      | Track scan state if needed |
+| **CloudWatch**                          | Logs                       |
+| **IAM**                                 | Access control             |
+| **KMS**                                 | Encryption                 |
+----------------------------------------------------------------------------------
+        USER
+         |
+         | JWT
+         v
+   API Gateway
+         |
+         v
+ Lambda Authorizer
+         |
+         v
+Upload URL Lambda
+         |
+         v
+PUT Pre-Signed URL
+         |
+         v
+S3 QUARANTINE
+         |
+         v
+GuardDuty
+         |
+         v
+EventBridge
+         |
+         v
+Scan Result Lambda
+         |
+      +--+--+
+      |     |
+    CLEAN  MALWARE
+      |     |
+      v     v
+S3 CLEAN  REJECT
+      |
+      |
+      v
+User asks for download
+      |
+      v
+JWT Authorization
+      |
+      v
+Download URL Lambda
+      |
+      v
+GET Pre-Signed URL
+      |
+      v
+S3 CLEAN
+      |
+      v
+USER
+
+
+------------------------------
+
+┌──────────────────────────────┐
+│ Customer Java / Spring Boot  │
+│ Application                  │
+│                              │
+│ APP_ID + Token / JWT         │
+└──────────────┬───────────────┘
+               │
+               │ HTTPS
+               │ Authorization: Bearer JWT
+               │
+               ▼
+┌──────────────────────────────┐
+│ AWS API Gateway              │
+│ REST API                     │
+│                              │
+│ POST /documents/upload-url   │
+│ GET  /documents/{id}/status  │
+│ GET  /documents/{id}/download│
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ Lambda Authorizer            │
+│ Python                       │
+│                              │
+│ Validate JWT                 │
+│ Validate APP_ID              │
+│ Extract USER_ID / CLIENT_ID  │
+└──────────────┬───────────────┘
+               │
+               │ Authorized
+               ▼
+┌──────────────────────────────┐
+│ Upload URL Lambda            │
+│ Python                       │
+│                              │
+│ Generate Document ID         │
+│ Generate S3 Object Key       │
+│ Generate PUT Pre-Signed URL  │
+└──────────────┬───────────────┘
+               │
+               │ PUT Pre-Signed URL
+               ▼
+┌──────────────────────────────┐
+│ S3 QUARANTINE BUCKET         │
+│                              │
+│ Private                     │
+│ No public access             │
+└──────────────┬───────────────┘
+               │
+               │ Object Created
+               ▼
+┌──────────────────────────────┐
+│ GuardDuty Malware Protection │
+│ for S3                       │
+└──────────────┬───────────────┘
+               │
+               │ Scan Result
+               ▼
+┌──────────────────────────────┐
+│ Amazon EventBridge           │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ Scan Result Lambda            │
+│ Python                       │
+└──────────────┬───────────────┘
+               │
+         ┌─────┴──────┐
+         │            │
+         ▼            ▼
+      CLEAN       MALICIOUS
+         │            │
+         ▼            ▼
+  S3 CLEAN       REJECT
+    BUCKET       / QUARANTINE
+         │
+         │
+         ▼
+Customer requests download
+         │
+         ▼
+API Gateway
+         │
+         ▼
+Lambda Authorizer
+         │
+         ▼
+Download URL Lambda
+         │
+         ▼
+GET Pre-Signed URL
+         │
+         ▼
+Customer Java Application
+         │
+         ▼
+Download clean document
+
