@@ -1,0 +1,20 @@
+JWT
+ ↓
+API Gateway PUT /documents/upload
+ ↓
+Lambda Authorizer
+ ↓
+Upload Lambda
+ ↓
+Pre-signed S3 URL
+ ↓
+S3 Quarantine
+ ↓
+EventBridge
+ ↓
+SQS
+ ↓
+Scan Processor Lambda
+ ├── CLEAN → S3 Clean
+ ├── THREAT_FOUND → remain in Quarantine
+ └── failure → retry → DLQ
