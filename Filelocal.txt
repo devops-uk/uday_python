@@ -1,0 +1,126 @@
+                  ┌──────────────────┐
+                  │      CLIENT      │
+                  └────────┬─────────┘
+                           │
+                    JWT + PUT request
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │   API GATEWAY    │
+                  │  REST API / PUT  │
+                  └────────┬─────────┘
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │ Lambda Authorizer│
+                  │      JWT         │
+                  └────────┬─────────┘
+                           │
+                         ALLOW
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │  Upload Lambda   │
+                  │     Python       │
+                  └────────┬─────────┘
+                           │
+                   Pre-signed URL
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │ Client uploads   │
+                  │ directly to S3   │
+                  └────────┬─────────┘
+                           │
+                           ▼
+                ┌───────────────────────┐
+                │   S3 QUARANTINE      │
+                │   doc-quarantine     │
+                └───────────┬───────────┘
+                            │
+                     Scan result event
+                            │
+                            ▼
+                ┌───────────────────────┐
+                │      EventBridge      │
+                └───────────┬───────────┘
+                            │
+                            ▼
+                ┌───────────────────────┐
+                │      SQS Queue        │
+                │ document-scan-queue   │
+                └───────────┬───────────┘
+                            │
+                            ▼
+                ┌───────────────────────┐
+                │ Scan Processor Lambda │
+                │       Python          │
+                └───────────┬───────────┘
+                            │
+                       CLEAN result
+                            │
+                            ▼
+                ┌───────────────────────┐
+                │      S3 CLEAN         │
+                │      doc-clean        │
+                └───────────────────────┘
+
+
+
+                EventBridge
+     ↑
+simulated CLEAN event
+
+---------------------------QA----------------
+
+S3 Quarantine
+      │
+      ▼
+GuardDuty Malware Protection
+      │
+      ▼
+GuardDuty / EventBridge
+      │
+      ▼
+SQS
+      │
+      ▼
+Scan Processor Lambda
+
+--------------
+
+
+                    S3 QUARANTINE
+                          │
+                          ▼
+                     Scan Result
+                     /          \
+                    /            \
+                CLEAN          THREAT_FOUND
+                  │                  │
+                  ▼                  ▼
+             S3 CLEAN          Stay in Quarantine
+                  │                  │
+                  ▼                  ▼
+              Available          NOT released
+
+              ----------------------------
+
+              EventBridge
+    │
+    ▼
+SQS
+    │
+    ▼
+Lambda
+    │
+    │ BAD_RESULT
+    ▼
+Exception
+    │
+    ▼
+SQS retry
+    │
+    │ after maxReceiveCount
+    ▼
+DLQ
