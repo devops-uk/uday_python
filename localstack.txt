@@ -1,0 +1,62 @@
+                       CLIENT
+                          │
+                     JWT Bearer
+                          │
+                          ▼
+                 ┌────────────────┐
+                 │  API Gateway   │
+                 │   REST / PUT   │
+                 └───────┬────────┘
+                         │
+                         ▼
+                 ┌────────────────┐
+                 │ Lambda         │
+                 │ Authorizer     │
+                 │ JWT / HS256    │
+                 └───────┬────────┘
+                         │
+                       ALLOW
+                         │
+                         ▼
+                 ┌────────────────┐
+                 │ Upload Lambda  │
+                 │    Python      │
+                 └───────┬────────┘
+                         │
+                   Pre-signed URL
+                         │
+                         ▼
+                 ┌────────────────┐
+                 │ S3 Quarantine  │
+                 └───────┬────────┘
+                         │
+                  Scan result event
+                         │
+                         ▼
+                 ┌────────────────┐
+                 │  EventBridge   │
+                 └───────┬────────┘
+                         │
+                         ▼
+                 ┌────────────────┐
+                 │  SQS Queue     │
+                 └───────┬────────┘
+                         │
+                         ▼
+                 ┌────────────────┐
+                 │ Scan Processor  │
+                 │    Lambda      │
+                 └───────┬────────┘
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+            CLEAN              THREAT_FOUND
+              │                     │
+              ▼                     ▼
+        S3 Clean              Quarantine
+              │
+              │
+        processing failure
+              │
+              ▼
+             DLQ
