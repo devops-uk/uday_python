@@ -1,0 +1,1482 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Secure document upload and malware scanning architecture.
+  API Gateway REST API -> Lambda TOKEN JWT Authorizer ->
+  Upload Lambda -> S3 Quarantine -> GuardDuty Malware Protection ->
+  EventBridge -> SQS -> Scan Processor Lambda -> S3 Clean.
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: DEV
+    AllowedValues:
+      - DEV
+      - TEST
+      - PROD
+
+  QuarantineBucketName:
+    Type: String
+    Default: document-scan-quarantine-123
+
+  CleanBucketName:
+    Type: String
+    Default: document-scan-clean-123
+
+  EnableGuardDutyMalwareProtection:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      Keep false while GuardDuty/account activation is pending.
+      Change to true when GuardDuty Malware Protection for S3 is ready.
+
+# ============================================================
+# CONDITIONS
+# ============================================================
+
+Conditions:
+
+  CreateGuardDutyPlan: !Equals
+    - !Ref EnableGuardDutyMalwareProtection
+    - "true"
+
+# ============================================================
+# RESOURCES
+# ============================================================
+
+Resources:
+
+  # ==========================================================
+  # S3 - QUARANTINE BUCKET
+  # ==========================================================
+
+  QuarantineBucket:
+    Type: AWS::S3::Bucket
+
+    Properties:
+
+      BucketName: !Ref QuarantineBucketName
+
+      VersioningConfiguration:
+        Status: Enabled
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+
+  # ==========================================================
+  # S3 - CLEAN BUCKET
+  # ==========================================================
+
+  CleanBucket:
+    Type: AWS::S3::Bucket
+
+    Properties:
+
+      BucketName: !Ref CleanBucketName
+
+      VersioningConfiguration:
+        Status: Enabled
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+
+  # ==========================================================
+  # SECRETS MANAGER - JWT SECRET
+  # ==========================================================
+
+  JwtSecret:
+    Type: AWS::SecretsManager::Secret
+
+    Properties:
+
+      Name: document-scan/jwt-secret
+
+      Description: >
+        HS256 signing secret for document upload JWT authorization.
+
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: JWT_SECRET
+        PasswordLength: 64
+        ExcludeSpace: true
+
+
+  # ==========================================================
+  # IAM - JWT AUTHORIZER ROLE
+  # ==========================================================
+
+  JwtAuthorizerRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      RoleName: document-jwt-authorizer-role
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+
+        Statement:
+
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+
+        - !Sub >
+          arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+
+        - PolicyName: DocumentJwtSecretAccess
+
+          PolicyDocument:
+
+            Version: "2012-10-17"
+
+            Statement:
+
+              - Sid: ReadJwtSecret
+
+                Effect: Allow
+
+                Action:
+                  - secretsmanager:GetSecretValue
+
+                Resource:
+                  - !Ref JwtSecret
+
+
+  # ==========================================================
+  # LAMBDA - JWT AUTHORIZER
+  # ==========================================================
+
+  JwtAuthorizerFunction:
+    Type: AWS::Lambda::Function
+
+    Properties:
+
+      FunctionName: document-jwt-authorizer
+
+      Runtime: python3.12
+
+      Handler: index.lambda_handler
+
+      Architectures:
+        - x86_64
+
+      Role: !GetAtt JwtAuthorizerRole.Arn
+
+      Timeout: 10
+
+      MemorySize: 128
+
+      Environment:
+
+        Variables:
+
+          JWT_SECRET_ARN: !Ref JwtSecret
+
+      Code:
+
+        ZipFile: |
+
+          import json
+          import boto3
+          import base64
+          import hashlib
+          import hmac
+          import time
+          import os
+
+          secrets_client = boto3.client("secretsmanager")
+
+          SECRET_ARN = os.environ["JWT_SECRET_ARN"]
+
+          _cached_secret = None
+
+
+          def get_jwt_secret():
+
+              global _cached_secret
+
+              if _cached_secret:
+                  return _cached_secret
+
+              response = secrets_client.get_secret_value(
+                  SecretId=SECRET_ARN
+              )
+
+              secret_data = json.loads(
+                  response["SecretString"]
+              )
+
+              _cached_secret = secret_data["JWT_SECRET"]
+
+              return _cached_secret
+
+
+          def base64url_decode(value):
+
+              padding = "=" * (-len(value) % 4)
+
+              return base64.urlsafe_b64decode(
+                  value + padding
+              )
+
+
+          def verify_jwt(token):
+
+              try:
+
+                  parts = token.split(".")
+
+                  if len(parts) != 3:
+                      return None
+
+                  encoded_header = parts[0]
+                  encoded_payload = parts[1]
+                  encoded_signature = parts[2]
+
+                  header = json.loads(
+                      base64url_decode(encoded_header)
+                  )
+
+                  payload = json.loads(
+                      base64url_decode(encoded_payload)
+                  )
+
+                  if header.get("alg") != "HS256":
+                      return None
+
+                  signing_input = (
+                      encoded_header
+                      + "."
+                      + encoded_payload
+                  )
+
+                  secret = get_jwt_secret()
+
+                  expected_signature = hmac.new(
+                      secret.encode("utf-8"),
+                      signing_input.encode("utf-8"),
+                      hashlib.sha256
+                  ).digest()
+
+                  actual_signature = base64url_decode(
+                      encoded_signature
+                  )
+
+                  if not hmac.compare_digest(
+                      expected_signature,
+                      actual_signature
+                  ):
+                      return None
+
+                  if payload.get("iss") != "local-auth":
+                      return None
+
+                  audience = payload.get("aud")
+
+                  if isinstance(audience, list):
+
+                      if "document-upload" not in audience:
+                          return None
+
+                  elif audience != "document-upload":
+
+                      return None
+
+                  expiration = payload.get("exp")
+
+                  if expiration is None:
+                      return None
+
+                  if time.time() >= float(expiration):
+                      return None
+
+                  return payload
+
+              except Exception as error:
+
+                  print(
+                      "JWT validation error:",
+                      str(error)
+                  )
+
+                  return None
+
+
+          def generate_policy(
+              principal_id,
+              effect,
+              resource,
+              context=None
+          ):
+
+              policy_document = {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Action": "execute-api:Invoke",
+                          "Effect": effect,
+                          "Resource": resource
+                      }
+                  ]
+              }
+
+              response = {
+                  "principalId": principal_id,
+                  "policyDocument": policy_document
+              }
+
+              if context:
+                  response["context"] = context
+
+              return response
+
+
+          def lambda_handler(event, context):
+
+              authorization_token = event.get(
+                  "authorizationToken",
+                  ""
+              )
+
+              if not authorization_token:
+                  raise Exception("Unauthorized")
+
+              if not authorization_token.startswith(
+                  "Bearer "
+              ):
+                  raise Exception("Unauthorized")
+
+              token = authorization_token[
+                  len("Bearer "):
+              ].strip()
+
+              claims = verify_jwt(token)
+
+              if not claims:
+                  raise Exception("Unauthorized")
+
+              principal_id = claims.get(
+                  "sub",
+                  "jwt-user"
+              )
+
+              return generate_policy(
+                  principal_id,
+                  "Allow",
+                  event["methodArn"],
+                  {
+                      "issuer": claims.get("iss", ""),
+                      "subject": principal_id
+                  }
+              )
+
+
+  # ==========================================================
+  # IAM - UPLOAD LAMBDA ROLE
+  # ==========================================================
+
+  UploadLambdaRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      RoleName: document-upload-role
+
+      AssumeRolePolicyDocument:
+
+        Version: "2012-10-17"
+
+        Statement:
+
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+
+        - !Sub >
+          arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+
+        - PolicyName: DocumentUploadS3Access
+
+          PolicyDocument:
+
+            Version: "2012-10-17"
+
+            Statement:
+
+              - Sid: UploadToQuarantine
+
+                Effect: Allow
+
+                Action:
+                  - s3:PutObject
+
+                Resource:
+                  - !Sub "${QuarantineBucket.Arn}/*"
+
+
+  # ==========================================================
+  # LAMBDA - DOCUMENT UPLOAD
+  # ==========================================================
+
+  UploadFunction:
+    Type: AWS::Lambda::Function
+
+    Properties:
+
+      FunctionName: document-upload-lambda
+
+      Runtime: python3.12
+
+      Handler: index.lambda_handler
+
+      Architectures:
+        - x86_64
+
+      Role: !GetAtt UploadLambdaRole.Arn
+
+      Timeout: 10
+
+      MemorySize: 128
+
+      Environment:
+
+        Variables:
+
+          QUARANTINE_BUCKET: !Ref QuarantineBucket
+
+      Code:
+
+        ZipFile: |
+
+          import json
+          import boto3
+          import uuid
+          import os
+
+          s3_client = boto3.client("s3")
+
+          QUARANTINE_BUCKET = os.environ[
+              "QUARANTINE_BUCKET"
+          ]
+
+          URL_EXPIRATION = 900
+
+
+          def lambda_handler(event, context):
+
+              print(
+                  "Received event:",
+                  json.dumps(event)
+              )
+
+              body = event
+
+              if "body" in event:
+
+                  body = event["body"]
+
+                  if isinstance(body, str):
+                      body = json.loads(body)
+
+              file_name = body.get("fileName")
+
+              content_type = body.get(
+                  "contentType",
+                  "application/octet-stream"
+              )
+
+              if not file_name:
+
+                  return {
+                      "statusCode": 400,
+                      "headers": {
+                          "Content-Type":
+                              "application/json"
+                      },
+                      "body": json.dumps({
+                          "error":
+                              "fileName is required"
+                      })
+                  }
+
+              document_id = str(uuid.uuid4())
+
+              object_key = (
+                  f"documents/"
+                  f"{document_id}/"
+                  f"{file_name}"
+              )
+
+              upload_url = (
+                  s3_client.generate_presigned_url(
+                      ClientMethod="put_object",
+                      Params={
+                          "Bucket":
+                              QUARANTINE_BUCKET,
+                          "Key":
+                              object_key,
+                          "ContentType":
+                              content_type
+                      },
+                      ExpiresIn=
+                          URL_EXPIRATION
+                  )
+              )
+
+              return {
+                  "statusCode": 200,
+                  "headers": {
+                      "Content-Type":
+                          "application/json"
+                  },
+                  "body": json.dumps({
+                      "status":
+                          "UPLOAD_PENDING",
+                      "documentId":
+                          document_id,
+                      "bucket":
+                          QUARANTINE_BUCKET,
+                      "objectKey":
+                          object_key,
+                      "uploadUrl":
+                          upload_url,
+                      "expiresIn":
+                          URL_EXPIRATION
+                  })
+              }
+
+
+  # ==========================================================
+  # SQS - DEAD LETTER QUEUE
+  # ==========================================================
+
+  ScanDeadLetterQueue:
+    Type: AWS::SQS::Queue
+
+    Properties:
+
+      QueueName: document-scan-dlq
+
+      MessageRetentionPeriod: 1209600
+
+
+  # ==========================================================
+  # SQS - MAIN SCAN QUEUE
+  # ==========================================================
+
+  ScanQueue:
+    Type: AWS::SQS::Queue
+
+    Properties:
+
+      QueueName: document-scan-queue
+
+      VisibilityTimeout: 180
+
+      ReceiveMessageWaitTimeSeconds: 20
+
+      RedrivePolicy:
+
+        deadLetterTargetArn:
+          !GetAtt ScanDeadLetterQueue.Arn
+
+        maxReceiveCount: 3
+
+
+  # ==========================================================
+  # IAM - SCAN PROCESSOR ROLE
+  # ==========================================================
+
+  ScanProcessorRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      RoleName: document-scan-processor-role
+
+      AssumeRolePolicyDocument:
+
+        Version: "2012-10-17"
+
+        Statement:
+
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+
+        - !Sub >
+          arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+
+        - PolicyName: DocumentScanQueueAccess
+
+          PolicyDocument:
+
+            Version: "2012-10-17"
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+
+                Resource:
+                  - !GetAtt ScanQueue.Arn
+
+        - PolicyName: DocumentScanS3Access
+
+          PolicyDocument:
+
+            Version: "2012-10-17"
+
+            Statement:
+
+              - Sid: ReadQuarantine
+
+                Effect: Allow
+
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+
+                Resource:
+                  - !Sub "${QuarantineBucket.Arn}/*"
+
+              - Sid: WriteClean
+
+                Effect: Allow
+
+                Action:
+                  - s3:PutObject
+
+                Resource:
+                  - !Sub "${CleanBucket.Arn}/*"
+
+              - Sid: DeleteQuarantine
+
+                Effect: Allow
+
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+
+                Resource:
+                  - !Sub "${QuarantineBucket.Arn}/*"
+
+
+  # ==========================================================
+  # LAMBDA - SCAN PROCESSOR
+  # ==========================================================
+
+  ScanProcessorFunction:
+    Type: AWS::Lambda::Function
+
+    Properties:
+
+      FunctionName: document-scan-processor
+
+      Runtime: python3.12
+
+      Handler: index.lambda_handler
+
+      Architectures:
+        - x86_64
+
+      Role: !GetAtt ScanProcessorRole.Arn
+
+      Timeout: 60
+
+      MemorySize: 128
+
+      Environment:
+
+        Variables:
+
+          CLEAN_BUCKET: !Ref CleanBucket
+
+      Code:
+
+        ZipFile: |
+
+          import json
+          import boto3
+          import os
+          import urllib.parse
+
+          s3 = boto3.client("s3")
+
+          CLEAN_BUCKET = os.environ[
+              "CLEAN_BUCKET"
+          ]
+
+
+          def process_scan_event(event):
+
+              detail = event.get(
+                  "detail",
+                  {}
+              )
+
+              scan_status = detail.get(
+                  "scanStatus"
+              )
+
+              object_details = detail.get(
+                  "s3ObjectDetails",
+                  {}
+              )
+
+              bucket_name = object_details.get(
+                  "bucketName"
+              )
+
+              object_key = object_details.get(
+                  "objectKey"
+              )
+
+              if object_key:
+                  object_key = urllib.parse.unquote_plus(
+                      object_key
+                  )
+
+              result_details = detail.get(
+                  "scanResultDetails",
+                  {}
+              )
+
+              scan_result = result_details.get(
+                  "scanResultStatus"
+              )
+
+              print(
+                  "Scan status:",
+                  scan_status
+              )
+
+              print(
+                  "Scan result:",
+                  scan_result
+              )
+
+              print(
+                  "Object:",
+                  f"s3://{bucket_name}/{object_key}"
+              )
+
+              if not bucket_name or not object_key:
+                  raise ValueError(
+                      "Missing S3 object details"
+                  )
+
+              if scan_result == "NO_THREATS_FOUND":
+
+                  copy_source = {
+                      "Bucket": bucket_name,
+                      "Key": object_key
+                  }
+
+                  s3.copy_object(
+                      Bucket=CLEAN_BUCKET,
+                      Key=object_key,
+                      CopySource=copy_source,
+                      ContentType="application/pdf",
+                      MetadataDirective="COPY"
+                  )
+
+                  s3.delete_object(
+                      Bucket=bucket_name,
+                      Key=object_key
+                  )
+
+                  print(
+                      "CLEAN object moved to:",
+                      f"s3://{CLEAN_BUCKET}/"
+                      f"{object_key}"
+                  )
+
+                  return
+
+              if scan_result == "THREATS_FOUND":
+
+                  print(
+                      "THREAT FOUND. "
+                      "Object remains quarantined."
+                  )
+
+                  return
+
+              if scan_result in [
+                  "UNSUPPORTED",
+                  "ACCESS_DENIED",
+                  "FAILED"
+              ]:
+
+                  raise RuntimeError(
+                      f"GuardDuty scan result: "
+                      f"{scan_result}"
+                  )
+
+              raise RuntimeError(
+                  f"Unknown scan result: "
+                  f"{scan_result}"
+              )
+
+
+          def lambda_handler(event, context):
+
+              print(
+                  "Received SQS event:",
+                  json.dumps(event)
+              )
+
+              for record in event.get(
+                  "Records",
+                  []
+              ):
+
+                  body = record.get(
+                      "body",
+                      "{}"
+                  )
+
+                  guardduty_event = json.loads(
+                      body
+                  )
+
+                  process_scan_event(
+                      guardduty_event
+                  )
+
+              return {
+                  "statusCode": 200
+              }
+
+
+  # ==========================================================
+  # SQS -> PROCESSOR LAMBDA
+  # ==========================================================
+
+  ScanQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+
+    DependsOn:
+      - ScanProcessorRole
+
+    Properties:
+
+      EventSourceArn:
+        !GetAtt ScanQueue.Arn
+
+      FunctionName:
+        !Ref ScanProcessorFunction
+
+      Enabled: true
+
+      BatchSize: 1
+
+
+  # ==========================================================
+  # EVENTBRIDGE -> SQS PERMISSION
+  # ==========================================================
+
+  ScanQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+
+    Properties:
+
+      Queues:
+        - !Ref ScanQueue
+
+      PolicyDocument:
+
+        Version: "2012-10-17"
+
+        Statement:
+
+          - Sid: AllowEventBridgeToSend
+
+            Effect: Allow
+
+            Principal:
+              Service:
+                - events.amazonaws.com
+
+            Action:
+              - sqs:SendMessage
+
+            Resource:
+              - !GetAtt ScanQueue.Arn
+
+            Condition:
+
+              StringEquals:
+
+                aws:SourceAccount:
+                  !Ref AWS::AccountId
+
+
+  # ==========================================================
+  # EVENTBRIDGE - GUARDDUTY SCAN RESULTS
+  # ==========================================================
+
+  GuardDutyScanResultRule:
+    Type: AWS::Events::Rule
+
+    Properties:
+
+      Name: document-scan-event-rule
+
+      Description: >
+        Routes GuardDuty Malware Protection
+        S3 scan results to SQS.
+
+      EventBusName: default
+
+      State: ENABLED
+
+      EventPattern:
+
+        source:
+          - aws.guardduty
+
+        detail-type:
+          - GuardDuty Malware Protection Object Scan Result
+
+      Targets:
+
+        - Id: ScanQueueTarget
+
+          Arn:
+            !GetAtt ScanQueue.Arn
+
+
+  # ==========================================================
+  # GUARDDUTY MALWARE PROTECTION SERVICE ROLE
+  # ==========================================================
+
+  GuardDutyMalwareProtectionRole:
+    Type: AWS::IAM::Role
+
+    Condition: CreateGuardDutyPlan
+
+    Properties:
+
+      RoleName: document-scan-guardduty-malware-role
+
+      AssumeRolePolicyDocument:
+
+        Version: "2012-10-17"
+
+        Statement:
+
+          - Effect: Allow
+
+            Principal:
+
+              Service:
+                - malware-protection-plan.guardduty.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+      Policies:
+
+        - PolicyName: GuardDutyS3MalwareProtection
+
+          PolicyDocument:
+
+            Version: "2012-10-17"
+
+            Statement:
+
+              - Sid: AllowManagedRuleToSendS3EventsToGuardDuty
+
+                Effect: Allow
+
+                Action:
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+
+                Resource:
+                  - !Sub >
+                    arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*
+
+                Condition:
+
+                  StringLike:
+
+                    events:ManagedBy:
+                      malware-protection-plan.guardduty.amazonaws.com
+
+
+              - Sid: AllowGuardDutyToMonitorEventBridgeManagedRule
+
+                Effect: Allow
+
+                Action:
+                  - events:DescribeRule
+                  - events:ListTargetsByRule
+
+                Resource:
+                  - !Sub >
+                    arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*
+
+
+              - Sid: AllowPostScanTag
+
+                Effect: Allow
+
+                Action:
+                  - s3:PutObjectTagging
+                  - s3:GetObjectTagging
+                  - s3:PutObjectVersionTagging
+                  - s3:GetObjectVersionTagging
+
+                Resource:
+                  - !Sub "${QuarantineBucket.Arn}/*"
+
+
+              - Sid: AllowEnableS3EventBridgeEvents
+
+                Effect: Allow
+
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+
+                Resource:
+                  - !GetAtt QuarantineBucket.Arn
+
+
+              - Sid: AllowPutValidationObject
+
+                Effect: Allow
+
+                Action:
+                  - s3:PutObject
+
+                Resource:
+                  - !Sub >
+                    ${QuarantineBucket.Arn}/malware-protection-resource-validation-object
+
+
+              - Sid: AllowCheckBucketOwnership
+
+                Effect: Allow
+
+                Action:
+                  - s3:ListBucket
+
+                Resource:
+                  - !GetAtt QuarantineBucket.Arn
+
+
+              - Sid: AllowMalwareScan
+
+                Effect: Allow
+
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+
+                Resource:
+                  - !Sub "${QuarantineBucket.Arn}/*"
+
+
+  # ==========================================================
+  # GUARDDUTY MALWARE PROTECTION PLAN
+  # ==========================================================
+
+  GuardDutyMalwareProtectionPlan:
+    Type: AWS::GuardDuty::MalwareProtectionPlan
+
+    Condition: CreateGuardDutyPlan
+
+    DependsOn:
+      - GuardDutyMalwareProtectionRole
+      - QuarantineBucket
+
+    Properties:
+
+      Role:
+        !GetAtt GuardDutyMalwareProtectionRole.Arn
+
+      ProtectedResource:
+
+        S3Bucket:
+
+          BucketName:
+            !Ref QuarantineBucket
+
+      Actions:
+
+        Tagging:
+
+          Status: ENABLED
+
+
+  # ==========================================================
+  # API GATEWAY REST API
+  # ==========================================================
+
+  DocumentUploadApi:
+    Type: AWS::ApiGateway::RestApi
+
+    Properties:
+
+      Name: document-upload-api
+
+      Description: >
+        Secure document upload REST API.
+
+      EndpointConfiguration:
+
+        Types:
+          - REGIONAL
+
+
+  # ==========================================================
+  # /documents
+  # ==========================================================
+
+  DocumentsResource:
+    Type: AWS::ApiGateway::Resource
+
+    Properties:
+
+      RestApiId:
+        !Ref DocumentUploadApi
+
+      ParentId:
+        !GetAtt DocumentUploadApi.RootResourceId
+
+      PathPart: documents
+
+
+  # ==========================================================
+  # /documents/upload
+  # ==========================================================
+
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+
+    Properties:
+
+      RestApiId:
+        !Ref DocumentUploadApi
+
+      ParentId:
+        !Ref DocumentsResource
+
+      PathPart: upload
+
+
+  # ==========================================================
+  # API GATEWAY JWT LAMBDA AUTHORIZER
+  # ==========================================================
+
+  JwtApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+
+    Properties:
+
+      Name: document-jwt-authorizer
+
+      RestApiId:
+        !Ref DocumentUploadApi
+
+      Type: TOKEN
+
+      IdentitySource:
+        method.request.header.Authorization
+
+      AuthorizerResultTtlInSeconds: 0
+
+      AuthorizerUri:
+        !Sub >
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JwtAuthorizerFunction.Arn}/invocations
+
+
+  # ==========================================================
+  # API GATEWAY PERMISSION TO CALL AUTHORIZER
+  # ==========================================================
+
+  JwtAuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+
+    Properties:
+
+      Action:
+        lambda:InvokeFunction
+
+      FunctionName:
+        !Ref JwtAuthorizerFunction
+
+      Principal:
+        apigateway.amazonaws.com
+
+      SourceArn:
+        !Sub >
+          arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${DocumentUploadApi}/authorizers/*
+
+
+  # ==========================================================
+  # API GATEWAY PERMISSION TO CALL UPLOAD LAMBDA
+  # ==========================================================
+
+  UploadLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+
+    Properties:
+
+      Action:
+        lambda:InvokeFunction
+
+      FunctionName:
+        !Ref UploadFunction
+
+      Principal:
+        apigateway.amazonaws.com
+
+      SourceArn:
+        !Sub >
+          arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${DocumentUploadApi}/*/PUT/documents/upload
+
+
+  # ==========================================================
+  # PUT /documents/upload
+  # ==========================================================
+
+  UploadPutMethod:
+    Type: AWS::ApiGateway::Method
+
+    DependsOn:
+      - JwtAuthorizerInvokePermission
+      - UploadLambdaInvokePermission
+
+    Properties:
+
+      RestApiId:
+        !Ref DocumentUploadApi
+
+      ResourceId:
+        !Ref UploadResource
+
+      HttpMethod: PUT
+
+      AuthorizationType: CUSTOM
+
+      AuthorizerId:
+        !Ref JwtApiAuthorizer
+
+      Integration:
+
+        Type: AWS_PROXY
+
+        IntegrationHttpMethod: POST
+
+        Uri:
+          !Sub >
+            arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadFunction.Arn}/invocations
+
+
+  # ==========================================================
+  # API DEPLOYMENT
+  # ==========================================================
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+
+    DependsOn:
+      - UploadPutMethod
+
+    Properties:
+
+      RestApiId:
+        !Ref DocumentUploadApi
+
+      Description: >
+        Secure document upload API deployment.
+
+
+  # ==========================================================
+  # API STAGE
+  # ==========================================================
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+
+    Properties:
+
+      RestApiId:
+        !Ref DocumentUploadApi
+
+      DeploymentId:
+        !Ref ApiDeployment
+
+      StageName:
+        !Ref EnvironmentName
+
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+
+Outputs:
+
+  ApiId:
+
+    Description: API Gateway REST API ID
+
+    Value:
+      !Ref DocumentUploadApi
+
+
+  ApiEndpoint:
+
+    Description: Secure document upload endpoint
+
+    Value:
+      !Sub >
+        https://${DocumentUploadApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${EnvironmentName}/documents/upload
+
+
+  QuarantineBucket:
+
+    Description: S3 quarantine bucket
+
+    Value:
+      !Ref QuarantineBucket
+
+
+  CleanBucket:
+
+    Description: S3 clean bucket
+
+    Value:
+      !Ref CleanBucket
+
+
+  ScanQueueUrl:
+
+    Description: Scan SQS queue
+
+    Value:
+      !Ref ScanQueue
+
+
+  ScanDeadLetterQueueUrl:
+
+    Description: Scan dead-letter queue
+
+    Value:
+      !Ref ScanDeadLetterQueue
+
+
+  JwtSecretArn:
+
+    Description: JWT secret ARN
+
+    Value:
+      !Ref JwtSecret
+
+
+  JwtAuthorizerFunctionName:
+
+    Description: JWT Lambda Authorizer
+
+    Value:
+      !Ref JwtAuthorizerFunction
+
+
+  UploadFunctionName:
+
+    Description: Document upload Lambda
+
+    Value:
+      !Ref UploadFunction
+
+
+  ScanProcessorFunctionName:
+
+    Description: Document scan processor Lambda
+
+    Value:
+      !Ref ScanProcessorFunction
+
+
+  GuardDutyMalwareProtectionPlanArn:
+
+    Condition: CreateGuardDutyPlan
+
+    Description: GuardDuty Malware Protection plan ARN
+
+    Value:
+      !GetAtt GuardDutyMalwareProtectionPlan.Arn
