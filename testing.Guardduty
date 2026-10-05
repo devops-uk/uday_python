@@ -1,0 +1,27 @@
+curl -i -X PUT \
+  "YOUR_API_ENDPOINT" \
+  -H "Content-Type: application/json" \
+  -d '{"fileName":"test.pdf","contentType":"application/pdf"}'
+
+-HTTP 401
+{"message":"Unauthorized"}
+
+
+-----------------------------
+export JWT_SECRET=$(aws secretsmanager get-secret-value \
+  --secret-id "document-scan/jwt-secret" \
+  --query SecretString \
+  --output text | python3 -c 'import sys,json; print(json.load(sys.stdin)["JWT_SECRET"])')
+
+
+----------------------------------------------------------------
+
+curl -i -X PUT \
+  "YOUR_API_ENDPOINT" \
+  -H "Authorization: Bearer $JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"fileName":"test-document.pdf","contentType":"application/pdf"}'
+
+
+-----------------------------------------------------
+
