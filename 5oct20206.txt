@@ -1,0 +1,51 @@
+AWS supports a TOKEN Lambda authorizer on REST APIs with an identity source such as method.request.header.Authorization; 
+setting the authorizer result TTL to 0 disables caching, matching what we configured manually. AWS Documentation
+For GuardDuty, I used AWS's documented malware-protection service-role permissions: managed EventBridge rule access, 
+S3 notification configuration, validation object, bucket ownership check, object read/version read, and tagging. 
+Because we're using SSE-S3 (AES256) rather than SSE-KMS, the KMS permissions from AWS's generic example are intentionally omitted.
+
+
+
+                         JWT_SECRET
+                             │
+                             ▼
+                    AWS Secrets Manager
+                             │
+                             ▼
+Client ────────► API Gateway REST API
+                       │
+                       ▼
+              Lambda JWT Authorizer
+                       │
+          ┌────────────┴─────────────┐
+          │                          │
+       Invalid                    Valid
+          │                          │
+       401 ❌                        ▼
+                             Upload Lambda
+                                   │
+                            Presigned URL
+                                   │
+                                   ▼
+                         S3 Quarantine
+                                   │
+                                   ▼
+                    GuardDuty Malware Scan
+                                   │
+                                   ▼
+                             EventBridge
+                                   │
+                                   ▼
+                          document-scan-queue
+                                   │
+                     retry 3x      │
+                       ┌───────────┴──────────┐
+                       ▼                      ▼
+                     DLQ              Scan Processor
+                                              │
+                         ┌────────────────────┴──────────────┐
+                         │                                   │
+                 NO_THREATS_FOUND                     THREATS_FOUND
+                         │                                   │
+                         ▼                                   ▼
+                    S3 Clean                       Remain Quarantined
